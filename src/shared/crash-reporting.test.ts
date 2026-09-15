@@ -404,6 +404,174 @@ describe('crash-reporting shared helpers', () => {
     expect(sanitizeCrashReportString(value)).toBe('[redacted-path] then recovered.')
   })
 
+  // Why these are asserted per platform rather than once: the generic path
+  // rules treated them differently, and in opposite directions. `file:///C:/…`
+  // begins its path after the drive colon, which the unquoted-Windows rule
+  // matched, so Windows frames were redacted whole and lost the only thing a
+  // minified stack can be clustered by. `file:///Users/…` and `file:///home/…`
+  // begin theirs at the scheme's third slash, which the unquoted-POSIX rule's
+  // lookbehind rejects, so those frames were not redacted at all and shipped
+  // the user's home directory. Field evidence for both: of 19 React #185
+  // payloads collected from the field, all 4 minified win32 stacks arrived with
+  // every offset destroyed while all 13 darwin/linux stacks kept theirs — and
+  // two payloads carried a real account name, one of them 48 times.
+  it.each([
+    [
+      'darwin',
+      'at _i (file:///Users/alice/Applications/Orca.app/Contents/Resources/app.asar/out/renderer/assets/Terminal-CHo8p2a1.js:1:7269)'
+    ],
+    [
+      'linux',
+      'at _i (file:///home/alice/.local/share/orca/resources/app.asar/out/renderer/assets/Terminal-CHo8p2a1.js:1:7269)'
+    ],
+    [
+      'win32 URL',
+      'at _i (file:///C:/Users/alice/AppData/Local/Programs/orca/resources/app.asar/out/renderer/assets/Terminal-CHo8p2a1.js:1:7269)'
+    ],
+    [
+      'win32 backslash',
+      'at _i (C:\\Users\\alice\\AppData\\Local\\Programs\\orca\\out\\renderer\\assets\\Terminal-CHo8p2a1.js:1:7269)'
+    ]
+  ])('keeps the asset and offset of a %s stack frame and drops the directory', (_p, frame) => {
+    const sanitized = sanitizeCrashReportString(frame, 4_000)
+
+    expect(sanitized).toBe('at _i ([redacted-path]/Terminal-CHo8p2a1.js:1:7269)')
+    expect(sanitized).not.toContain('alice')
+  })
+
+  // Why every one of these carries a REAL offset: the offset is what arms the
+  // rule, so a fixture without one asserts the safe behaviour of a code path
+  // that never runs. Each case below is a file that ends in .js at a line and
+  // column and must still be redacted whole, because only a bundler content
+  // hash makes a basename safe to keep — "ends in .js" is a property no user
+  // file is prevented from having.
+  it.each([
+    ['an unhashed entry point', 'at f (/Users/alice/app/index.js:1:2)', 'index.js'],
+    ['a user document', 'crash at /Users/alice/Documents/bob-divorce-settlement.js:3:9', 'divorce'],
+    [
+      'a document naming a person',
+      'crash at /Users/alice/Documents/alice.smith-acme-payroll-2025.js:1:1',
+      'payroll'
+    ],
+    [
+      'a project setup script',
+      'at Object.x (/Users/alice/work/acme-gateway/.orca/setup.js:4:11)',
+      'acme-gateway'
+    ],
+    ['a too-short hash-like tail', 'at f (/Users/alice/app/report-Q3-2025.js:1:2)', 'report-Q3'],
+    [
+      'an all-lowercase eight-letter tail',
+      'at f (/Users/alice/app/client-invoices.js:1:2)',
+      'invoices'
+    ]
+  ])('still redacts %s whole', (_case, value, marker) => {
+    const sanitized = sanitizeCrashReportString(value, 4_000)
+
+    expect(sanitized).not.toContain('alice')
+    expect(sanitized).not.toContain(marker)
+  })
+
+  // Why a separate case: this hash holds dashes, which the gate's 8-character
+  // base64url window must accept. It is a real asset name from the field corpus
+  // and it is the shape a naive "last dash segment is alphanumeric" gate drops.
+  it('keeps a hash that contains dashes', () => {
+    const sanitized = sanitizeCrashReportString(
+      'at _i (file:///Users/alice/orca/assets/client-creation-action-error-ihM-f-zg.js:1:7269)',
+      4_000
+    )
+
+    expect(sanitized).toBe(
+      'at _i ([redacted-path]/client-creation-action-error-ihM-f-zg.js:1:7269)'
+    )
+  })
+
+  // Why: a frame with no offset has nothing to cluster on, so it stays whole.
+  it('still redacts a hashed asset with no offset whole', () => {
+    const sanitized = sanitizeCrashReportString(
+      'at _i (file:///Users/alice/orca/out/renderer/assets/Terminal-CHo8p2a1.js)',
+      4_000
+    )
+
+    expect(sanitized).not.toContain('alice')
+    expect(sanitized).not.toContain('Terminal-CHo8p2a1.js')
+  })
+
+  // Why these are pinned: an earlier revision anchored on any `scheme://`, which
+  // ate the host of an http frame and mangled module paths that are themselves
+  // the triage axis for their loader and carry no machine identity.
+  it.each([
+    ['an http asset frame', 'at ai (https://localhost:5173/assets/app-CHo8p2a1.js:1:2)'],
+    ['a webpack module', 'at f (webpack://orca/./src/components/Terminal-CHo8p2a1.js:10:5)'],
+    ['an extension script', 'at f (chrome-extension://abcdefghijklmnop/content-CHo8p2a1.js:1:2)'],
+    ['a relative frame', 'at f (./src/app.js:1:2)']
+  ])('leaves %s untouched', (_case, value) => {
+    expect(sanitizeCrashReportString(value, 4_000)).toBe(value)
+  })
+
+  // Why each of these is pinned: every one of them regressed while this rule
+  // was being written. The drive-letter branch matched the `e:` inside `file:`
+  // and ate half the scheme; the unquoted file:// rule truncated a quoted URL
+  // at its first space and left the tail behind; and http(s) URLs and Node's
+  // `node:internal/...` frames must not be touched at all.
+  it.each([
+    [
+      // No directory means nothing to preserve a basename against, so this
+      // falls through to whole-path redaction rather than being a special case.
+      'a file URL with no directory',
+      'file:///Terminal-CHo8p2a1.js:1:7269',
+      '[redacted-path]'
+    ],
+    [
+      'a quoted URL holding spaces',
+      'opened "file:///Users/alice/My Docs/notes.log" ok',
+      'opened [redacted-path] ok'
+    ],
+    [
+      'a percent-encoded space',
+      'opened file:///Users/alice/My%20Docs/notes.log ok',
+      'opened [redacted-path] ok'
+    ],
+    [
+      'a POSIX file URL in prose',
+      'file:///home/alice/orca/x.log then recovered.',
+      '[redacted-path] then recovered.'
+    ],
+    [
+      'an http URL',
+      'see https://react.dev/errors/185 for details',
+      'see https://react.dev/errors/185 for details'
+    ],
+    [
+      'a node internal frame',
+      'at genericNodeError (node:internal/errors:986:15)',
+      'at genericNodeError (node:internal/errors:986:15)'
+    ],
+    [
+      'prose holding a colon',
+      'the ratio was 3:4 and file: was empty',
+      'the ratio was 3:4 and file: was empty'
+    ]
+  ])('handles %s', (_case, value, expected) => {
+    expect(sanitizeCrashReportString(value, 4_000)).toBe(expected)
+  })
+
+  it('keeps every frame of a multi-frame minified stack clusterable', () => {
+    const stack = [
+      'Error: Minified React error #185; visit https://react.dev/errors/185',
+      '    at _i (file:///C:/Users/alice/AppData/Local/orca/assets/client-CXJwj0PF.js:8:27510)',
+      '    at mi (file:///C:/Users/alice/AppData/Local/orca/assets/client-CXJwj0PF.js:8:27083)',
+      '    at Kc (file:///C:/Users/alice/AppData/Local/orca/assets/Terminal-CHo8p2a1.js:1:91686)'
+    ].join('\n')
+
+    const sanitized = sanitizeCrashReportString(stack, 4_000)
+
+    expect(sanitized).toContain('client-CXJwj0PF.js:8:27510')
+    expect(sanitized).toContain('client-CXJwj0PF.js:8:27083')
+    expect(sanitized).toContain('Terminal-CHo8p2a1.js:1:91686')
+    expect(sanitized).not.toContain('alice')
+    expect(sanitized).not.toContain('AppData')
+  })
+
   it('redacts the secret shapes a full-page notes box can now hold', () => {
     const note = [
       'pat github_pat_11AAAAAAA0abcdefghijklmnopqrstuvwxyz012345',
