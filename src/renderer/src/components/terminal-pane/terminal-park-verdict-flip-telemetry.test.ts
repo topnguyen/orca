@@ -4,6 +4,7 @@ import {
   TERMINAL_TAB_PARK_FLIP_BURST_WINDOW_MS,
   TERMINAL_TAB_PARK_FLIP_COMMIT_COST,
   TERMINAL_TAB_PARK_FLIP_NOTICE_LIMIT,
+  TERMINAL_TAB_PARK_FLIP_SUSTAINED_PIN_MAX_MS,
   TERMINAL_TAB_PARK_FLIP_WINDOW_MS,
   getParkVerdictUnparkPinUntilMs,
   recordParkVerdictFlips,
@@ -112,15 +113,259 @@ describe('recordParkVerdictFlips', () => {
     )
   })
 
-  // Why: slow churn must not be damped — parking it out for a minute would cost
-  // a mounted pane's memory for a verdict that was never near React's bail.
-  it('does not pin churn spread past the burst window', () => {
+  // Why this replaced "does not pin churn spread past the burst window": that
+  // rule read the pin as purely a React #185 guard, so slow churn was left to
+  // run rather than spend a mounted pane's memory on it. The field disagreed —
+  // slow churn remounts the pane every ~3.8s for as long as it lasts, and a
+  // remount re-establishes a remote terminal. Memory is the cheaper side.
+  it('pins churn that is too slow to burst but reaches the notice limit', () => {
     const records = new Map<string, ParkVerdictFlipRecord>()
     for (let i = 0; i < TERMINAL_TAB_PARK_FLIP_NOTICE_LIMIT + 1; i += 1) {
       observe({ records, parked: i % 2 === 0, nowMs: 1_000 + i * SLOW_CHURN_STEP_MS })
     }
 
-    expect(records.get(TAB)?.pinnedUntilMs ?? null).toBeNull()
+    const noticeMs = 1_000 + TERMINAL_TAB_PARK_FLIP_NOTICE_LIMIT * SLOW_CHURN_STEP_MS
+    expect(records.get(TAB)?.pinnedUntilMs).toBe(noticeMs + TERMINAL_TAB_PARK_FLIP_WINDOW_MS)
+    expect(recordBreadcrumb).toHaveBeenCalledWith(
+      'terminal_park_verdict_churn',
+      expect.objectContaining({
+        trigger: 'window',
+        pinnedForMs: TERMINAL_TAB_PARK_FLIP_WINDOW_MS,
+        sustainedPinCount: 1
+      })
+    )
+  })
+
+  // Why these cadences and not round numbers: they are the field's. Bundle
+  // Nz4kzIG_NwLd8KObgjJDKA (v1.4.201, win32) carries 52 churn crumbs, and they
+  // are TWO unrelated episodes in two launches, not one run:
+  //   L3 (09-14 00:53) 35 crumbs, 1 tab, 46.9 min, 34 window + 1 burst
+  //   L4 (09-14 17:07) 17 crumbs, 4 tabs,  8.9 min, 17 window + 0 burst
+  // The user filed from L4, 12.3 min after its churn had already stopped.
+  //
+  // Per-flip cadence is elapsedMs / (NOTICE_LIMIT - 1), NOT / NOTICE_LIMIT: the
+  // window opens ON a flip (resetFlipWindows then `flips += 1`), so the 12th
+  // flip sits 11 intervals later. L3 runs 3197/4627/5442 ms per flip
+  // (min/median/max); L4 runs 3193/3203/5014.
+  //
+  // The slow end is where this matters. The limit needs 12 flips inside 60s, so
+  // it is unreachable past 60s/11 = 5454.5 ms per flip — and the field's slowest
+  // observed episode sits 12.7 ms inside that, not comfortably clear of it. The
+  // cadences below therefore span the real range INCLUDING that edge, and the
+  // edge case asserts the weaker damping that actually happens there.
+  describe('sustained field-cadence churn', () => {
+    const FIELD_FLIP_INTERVAL_MS = 4_627
+    const FIELD_SLOWEST_FLIP_INTERVAL_MS = 5_442
+    const FIELD_CHURN_DURATION_MS = 47 * 60_000
+
+    // Fixed duration rather than a fixed flip count, so every cadence covers
+    // the same 47 minutes the field bundle spans and the crumb budget compares.
+    function runFieldChurn(stepMs = FIELD_FLIP_INTERVAL_MS): {
+      flips: number
+      pinnedPasses: number
+      crumbs: number
+    } {
+      const records = new Map<string, ParkVerdictFlipRecord>()
+      const flips = Math.ceil(FIELD_CHURN_DURATION_MS / stepMs)
+      let pinnedPasses = 0
+      for (let i = 0; i < flips; i += 1) {
+        const nowMs = 1_000 + i * stepMs
+        observe({ records, parked: i % 2 === 0, nowMs })
+        const { pinnedTabIds } = selectParkVerdictPinnedTabIds({
+          records,
+          tabIds: [TAB],
+          nowMs
+        })
+        if (pinnedTabIds.size > 0) {
+          pinnedPasses += 1
+        }
+      }
+      return {
+        flips,
+        pinnedPasses,
+        crumbs: recordBreadcrumb.mock.calls.filter(
+          (call) => call[0] === 'terminal_park_verdict_churn'
+        ).length
+      }
+    }
+
+    // Two harnesses, and the difference between them matters.
+    //
+    // This one is OPEN-LOOP: it drives the parked flag unconditionally. The real
+    // hook subtracts pinned tabs from the rendered verdict, so a pinned tab
+    // records no flip at all. That makes the percentages below a pin DUTY CYCLE,
+    // not a count of harm avoided, and it is why an earlier revision of this fix
+    // measured clean here while its back-off never left 1x in production. Keep
+    // it as a cheap regression guard; read 'reaches the ceiling under the real
+    // pin feedback loop' for behaviour.
+    //
+    // The user-visible quantity is pane remounts, measured closed-loop over the
+    // same 47 minutes:
+    //
+    //   per flip   remounts before -> after   churn crumbs
+    //   3193 ms    884 -> 98  (9.0x fewer)     46 -> 8
+    //   4627 ms    610 -> 98  (6.2x fewer)     47 -> 8
+    //   5442 ms    519 -> 346 (1.5x fewer)     42 -> 15
+    //
+    // The last row is the honest one. At the field's slowest observed cadence
+    // each 60s window only barely reaches 12 flips, so damping engages late and
+    // lapses often, and the win shrinks to about a third.
+    it.each([
+      ['fastest observed', 3_193, 0.5],
+      ['median', FIELD_FLIP_INTERVAL_MS, 0.5],
+      ['slowest observed', FIELD_SLOWEST_FLIP_INTERVAL_MS, 0.4]
+    ])('damps %s field churn instead of letting it run all session', (_label, stepMs, floor) => {
+      const { flips, pinnedPasses, crumbs } = runFieldChurn(stepMs)
+
+      expect(pinnedPasses).toBeGreaterThan(flips * floor)
+      expect(crumbs).toBeLessThan(20)
+    })
+
+    // Why this asserts the gap rather than closing it: reaching the notice
+    // limit takes NOTICE_LIMIT - 1 intervals, so churn averaging slower than
+    // 60s/11 = 5454.5ms per flip never reaches it and stays undamped — before
+    // this change and after, which is why the crumb count is 0 rather than 43.
+    // The edge is sharp: this harness pins 60% of passes at 5450ms and 0% at
+    // 5460ms. Closing the gap means widening the window, which would also
+    // re-arm the pin on honest parking — that round-trips on the order of
+    // minutes.
+    //
+    // The field is NOT comfortably clear of this: its slowest observed episode
+    // runs 5441.8ms per flip, 12.7ms inside the edge. Churn a hair slower than
+    // anything yet observed would evade the damper entirely. Recorded so a
+    // later change to either constant cannot move the edge unnoticed.
+    it('leaves churn slower than the window undamped', () => {
+      const tooSlowMs =
+        Math.ceil(TERMINAL_TAB_PARK_FLIP_WINDOW_MS / (TERMINAL_TAB_PARK_FLIP_NOTICE_LIMIT - 1)) + 1
+      const { pinnedPasses, crumbs } = runFieldChurn(tooSlowMs)
+
+      expect(pinnedPasses).toBe(0)
+      expect(crumbs).toBe(0)
+    })
+
+    it('backs the pin off to the ceiling while the churn persists', () => {
+      const records = new Map<string, ParkVerdictFlipRecord>()
+      const flips = Math.ceil(FIELD_CHURN_DURATION_MS / FIELD_FLIP_INTERVAL_MS)
+      for (let i = 0; i < flips; i += 1) {
+        observe({ records, parked: i % 2 === 0, nowMs: 1_000 + i * FIELD_FLIP_INTERVAL_MS })
+      }
+
+      const pinnedForMs = recordBreadcrumb.mock.calls
+        .filter((call) => call[0] === 'terminal_park_verdict_churn')
+        .map((call) => (call[1] as { pinnedForMs: number }).pinnedForMs)
+      expect(pinnedForMs[0]).toBe(TERMINAL_TAB_PARK_FLIP_WINDOW_MS)
+      expect(pinnedForMs.at(-1)).toBe(TERMINAL_TAB_PARK_FLIP_SUSTAINED_PIN_MAX_MS)
+    })
+
+    // Why this drives the loop the way useTerminalParkVerdictPin does — record
+    // first, then subtract the pinned set from the NEXT pass's verdict — and
+    // why every other test here must not: with the pin fed back, a pinned tab
+    // records no flip at all, and that is the state the back-off has to survive.
+    // The open-loop harness above cannot see it, and shipped a fix whose
+    // exponential back-off never left 1x in production: the quiet-branch reset
+    // measured staleness from windowStartMs, which a pin always makes older
+    // than a full window, so every lapse wiped the count.
+    function runClosedLoopChurn(stepMs: number, durationMs = 20 * 60_000) {
+      const records = new Map<string, ParkVerdictFlipRecord>()
+      const passes = Math.ceil(durationMs / stepMs)
+      let pinned = new Set<string>()
+      let remounts = 0
+      let previouslyParked = false
+      for (let i = 0; i < passes; i += 1) {
+        const nowMs = 1_000 + i * stepMs
+        const candidateParked = i % 2 === 0
+        const renderedParked = candidateParked && !pinned.has(TAB)
+        recordParkVerdictFlips({
+          records,
+          liveTabIds: new Set([TAB]),
+          nextParkedTabIds: new Set(renderedParked ? [TAB] : []),
+          nowMs
+        })
+        pinned = selectParkVerdictPinnedTabIds({ records, tabIds: [TAB], nowMs }).pinnedTabIds
+        if (renderedParked !== previouslyParked) {
+          remounts += 1
+          previouslyParked = renderedParked
+        }
+      }
+      const crumbs = recordBreadcrumb.mock.calls.filter(
+        (call) => call[0] === 'terminal_park_verdict_churn'
+      )
+      return {
+        remounts,
+        crumbs: crumbs.length,
+        pinnedForMs: crumbs.map((call) => (call[1] as { pinnedForMs: number }).pinnedForMs)
+      }
+    }
+
+    it('reaches the ceiling under the real pin feedback loop', () => {
+      const { pinnedForMs } = runClosedLoopChurn(FIELD_FLIP_INTERVAL_MS)
+
+      // The whole sequence, not just its ends: a base-8 back-off, or a reset
+      // that fires one window early, both pass an ends-only assertion.
+      expect(pinnedForMs.length).toBeGreaterThan(3)
+      expect(pinnedForMs.slice(0, 4)).toEqual([
+        TERMINAL_TAB_PARK_FLIP_WINDOW_MS,
+        TERMINAL_TAB_PARK_FLIP_WINDOW_MS * 2,
+        TERMINAL_TAB_PARK_FLIP_WINDOW_MS * 4,
+        TERMINAL_TAB_PARK_FLIP_WINDOW_MS * 8
+      ])
+      expect(pinnedForMs.at(-1)).toBe(TERMINAL_TAB_PARK_FLIP_SUSTAINED_PIN_MAX_MS)
+    })
+
+    // The user-visible quantity. Every flip that survives the pin is one pane
+    // remount; the percentages elsewhere are a pin duty cycle, not this.
+    it('cuts remounts against the undamped baseline', () => {
+      const { remounts, crumbs } = runClosedLoopChurn(FIELD_FLIP_INTERVAL_MS)
+
+      // Undamped, 20 min at 4627ms/flip is 260 remounts and 20 crumbs.
+      expect(remounts).toBeLessThan(80)
+      expect(crumbs).toBeLessThan(10)
+    })
+
+    // Why: without this the back-off is a ratchet — a tab that churned once at
+    // launch would still be carrying an 8-minute pin hours later.
+    it('starts over at one window after a quiet window', () => {
+      const records = new Map<string, ParkVerdictFlipRecord>()
+      for (let i = 0; i < TERMINAL_TAB_PARK_FLIP_NOTICE_LIMIT + 1; i += 1) {
+        observe({ records, parked: i % 2 === 0, nowMs: 1_000 + i * SLOW_CHURN_STEP_MS })
+      }
+      expect(records.get(TAB)?.sustainedPinCount).toBe(1)
+
+      const quietMs = 1_000 + TERMINAL_TAB_PARK_FLIP_SUSTAINED_PIN_MAX_MS * 4
+      observe({ records, parked: true, nowMs: quietMs })
+      expect(records.get(TAB)?.sustainedPinCount).toBe(0)
+
+      recordBreadcrumb.mockClear()
+      for (let i = 1; i <= TERMINAL_TAB_PARK_FLIP_NOTICE_LIMIT; i += 1) {
+        observe({ records, parked: i % 2 === 0, nowMs: quietMs + i * SLOW_CHURN_STEP_MS })
+      }
+      expect(recordBreadcrumb).toHaveBeenCalledWith(
+        'terminal_park_verdict_churn',
+        expect.objectContaining({
+          pinnedForMs: TERMINAL_TAB_PARK_FLIP_WINDOW_MS,
+          sustainedPinCount: 1
+        })
+      )
+    })
+  })
+
+  // Why: without this, deleting the below-limit reset at the flip path is
+  // invisible — the back-off would keep climbing across a window that proved
+  // the churn had stopped.
+  it('clears the back-off when a window closes below the notice limit', () => {
+    const records = new Map<string, ParkVerdictFlipRecord>()
+    for (let i = 0; i < TERMINAL_TAB_PARK_FLIP_NOTICE_LIMIT + 1; i += 1) {
+      observe({ records, parked: i % 2 === 0, nowMs: 1_000 + i * SLOW_CHURN_STEP_MS })
+    }
+    expect(records.get(TAB)?.sustainedPinCount).toBe(1)
+
+    // One flip, a full window later: the window closes holding far fewer than
+    // the notice limit, which is the only proof the churn actually stopped.
+    const nextWindowMs = 1_000 + TERMINAL_TAB_PARK_FLIP_SUSTAINED_PIN_MAX_MS * 2
+    observe({ records, parked: false, nowMs: nextWindowMs })
+    observe({ records, parked: true, nowMs: nextWindowMs + TERMINAL_TAB_PARK_FLIP_WINDOW_MS + 1 })
+
+    expect(records.get(TAB)?.sustainedPinCount).toBe(0)
   })
 
   it('re-arms after the window elapses', () => {
